@@ -694,5 +694,19 @@
     "method": "post",
     "toolName": "reply-to-group-thread",
     "workScopes": ["Group.ReadWrite.All"]
+  },
+  {
+    "pathPattern": "/auditLogs/directoryAudits",
+    "method": "get",
+    "toolName": "list-directory-audits",
+    "workScopes": ["AuditLog.Read.All"],
+    "llmTip": "Use this tool to list directory audit logs"
+  },
+  {
+    "pathPattern": "/auditLogs/signIns",
+    "method": "get",
+    "toolName": "list-sign-ins",
+    "workScopes": ["AuditLog.Read.All"],
+    "llmTip": "Use this tool to list sign-in audit logs"
   }
 ]
