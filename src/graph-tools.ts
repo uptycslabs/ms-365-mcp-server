@@ -139,9 +139,11 @@ async function executeGraphTool(
           case 'Path': {
             // Check if this parameter should skip URL encoding (for function-style API calls)
             const shouldSkipEncoding = config?.skipEncoding?.includes(paramName) ?? false;
+            // Preserve '=' in path segments: base64 IDs (e.g. To-Do, Calendar) use '=' for
+            // padding and Microsoft Graph routing fails when '=' is encoded as '%3D'.
             const encodedValue = shouldSkipEncoding
               ? (paramValue as string)
-              : encodeURIComponent(paramValue as string);
+              : encodeURIComponent(paramValue as string).replace(/%3D/gi, '=');
 
             path = path
               .replace(`{${paramName}}`, encodedValue)
@@ -184,6 +186,14 @@ async function executeGraphTool(
       } else if (paramName === 'body') {
         body = paramValue;
         logger.info(`Set body param: ${JSON.stringify(body)}`);
+      } else if (path.includes(`:${paramName}`) || path.includes(`{${paramName}}`)) {
+        // Fallback: substitute path parameters not formally declared in parameterDefinitions
+        // (generated/client.ts omits many path params from the parameters array)
+        const encodedValue = encodeURIComponent(paramValue as string);
+        path = path
+          .replace(`{${paramName}}`, encodedValue)
+          .replace(`:${paramName}`, encodedValue);
+        logger.info(`Substituted undeclared path param ${paramName}=${paramValue}`);
       }
     }
 
@@ -211,10 +221,12 @@ async function executeGraphTool(
 
     if (Object.keys(queryParams).length > 0) {
       const queryString = Object.entries(queryParams)
-        .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`)
+        .map(([key, value]) => `${key}=${encodeURIComponent(value)}`)
         .join('&');
       path = `${path}${path.includes('?') ? '&' : '?'}${queryString}`;
     }
+
+    logger.info(`Final URL path for ${tool.alias}: ${path}`);
 
     const options: {
       method: string;
@@ -413,6 +425,18 @@ export function registerGraphTools(
     if (tool.parameters && tool.parameters.length > 0) {
       for (const param of tool.parameters) {
         paramSchema[param.name] = param.schema || z.any();
+      }
+    }
+
+    // Auto-add path parameters extracted from the URL template (e.g. :todoTaskListId).
+    // The generated client.ts omits many path params from the parameters array, causing
+    // Zod to strip them before executeGraphTool runs and leaving the literal placeholder
+    // in the URL (→ Microsoft Graph 400 RequestBroker--ParseUri).
+    for (const match of tool.path.matchAll(/:([a-zA-Z0-9_]+)/g)) {
+      const pathParamName = match[1];
+      if (!paramSchema[pathParamName]) {
+        const label = pathParamName.replace(/([A-Z])/g, ' $1').toLowerCase().trim();
+        paramSchema[pathParamName] = z.string().describe(`The ${label}`);
       }
     }
 
