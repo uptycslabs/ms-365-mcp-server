@@ -18,8 +18,7 @@ This server supports multiple Microsoft cloud environments:
 
 ## Prerequisites
 
-- Node.js >= 20 (recommended)
-- Node.js 14+ may work with dependency warnings
+- Node.js 20+
 
 ## Features
 
