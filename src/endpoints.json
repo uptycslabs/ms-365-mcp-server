@@ -404,7 +404,8 @@
     "pathPattern": "/me/todo/lists/{todoTaskList-id}/tasks",
     "method": "get",
     "toolName": "list-todo-tasks",
-    "scopes": ["Tasks.Read"]
+    "scopes": ["Tasks.Read"],
+    "llmTip": "$select is not supported for this endpoint and causes a RequestBroker--ParseUri error. Do not include $select in requests."
   },
   {
     "pathPattern": "/me/todo/lists/{todoTaskList-id}/tasks/{todoTask-id}",
