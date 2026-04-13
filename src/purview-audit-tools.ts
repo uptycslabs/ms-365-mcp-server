@@ -8,7 +8,13 @@ const MAX_POLLS = 60; // 10 minutes max
 
 const BETA = { apiVersion: 'beta' } as const;
 
-type AuditLogQueryStatus = 'notStarted' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'unknownFutureValue';
+type AuditLogQueryStatus =
+  | 'notStarted'
+  | 'running'
+  | 'succeeded'
+  | 'failed'
+  | 'cancelled'
+  | 'unknownFutureValue';
 
 interface AuditLogQuery {
   id: string;
@@ -85,21 +91,22 @@ Uses the /beta API endpoint as this feature is not available in v1.0.`,
       filterStartDateTime: z
         .string()
         .optional()
-        .describe('(Mode 1) Start of the search time range (ISO 8601, e.g. 2024-01-01T00:00:00Z). Required when queryId is not provided.'),
+        .describe(
+          '(Mode 1) Start of the search time range (ISO 8601, e.g. 2024-01-01T00:00:00Z). Required when queryId is not provided.'
+        ),
       filterEndDateTime: z
         .string()
         .optional()
-        .describe('(Mode 1) End of the search time range (ISO 8601, e.g. 2024-01-02T00:00:00Z). Required when queryId is not provided.'),
-      displayName: z
-        .string()
-        .optional()
-        .describe('(Mode 1) Optional display name for this query'),
+        .describe(
+          '(Mode 1) End of the search time range (ISO 8601, e.g. 2024-01-02T00:00:00Z). Required when queryId is not provided.'
+        ),
+      displayName: z.string().optional().describe('(Mode 1) Optional display name for this query'),
       recordTypeFilters: z
         .array(z.string())
         .optional()
         .describe(
           '(Mode 1) Filter by audit record types, e.g. ["sharePoint", "azureActiveDirectory", "microsoftTeams"]. ' +
-          'See Microsoft docs for the full list of supported values.'
+            'See Microsoft docs for the full list of supported values.'
         ),
       keywordFilter: z
         .string()
@@ -108,7 +115,9 @@ Uses the /beta API endpoint as this feature is not available in v1.0.`,
       serviceFilter: z
         .string()
         .optional()
-        .describe('(Mode 1) Filter by Microsoft service workload name (e.g. "Exchange", "SharePoint")'),
+        .describe(
+          '(Mode 1) Filter by Microsoft service workload name (e.g. "Exchange", "SharePoint")'
+        ),
       operationFilters: z
         .array(z.string())
         .optional()
@@ -133,11 +142,15 @@ Uses the /beta API endpoint as this feature is not available in v1.0.`,
       queryId: z
         .string()
         .optional()
-        .describe('(Mode 2) ID of a previously completed audit log query. When provided, skips create and polling.'),
+        .describe(
+          '(Mode 2) ID of a previously completed audit log query. When provided, skips create and polling.'
+        ),
       nextLink: z
         .string()
         .optional()
-        .describe('(Mode 2) Pagination cursor from a previous response. When provided with queryId, fetches the next page of results.'),
+        .describe(
+          '(Mode 2) Pagination cursor from a previous response. When provided with queryId, fetches the next page of results.'
+        ),
     },
     async (params) => {
       // ── Mode 2: fetch records for an existing queryId ────────────────────
@@ -147,7 +160,9 @@ Uses the /beta API endpoint as this feature is not available in v1.0.`,
           ? extractPathAndQuery(nextLink)
           : `/security/auditLog/queries/${queryId}/records`;
 
-        logger.info(`[Purview] Mode 2 — fetching records for queryId=${queryId}, hasNextLink=${nextLink != null}`);
+        logger.info(
+          `[Purview] Mode 2 — fetching records for queryId=${queryId}, hasNextLink=${nextLink != null}`
+        );
 
         const result = await fetchRecordsPage(graphClient, path);
         if (result.error) {
@@ -158,7 +173,9 @@ Uses the /beta API endpoint as this feature is not available in v1.0.`,
         const records = page.value ?? [];
         const responseNextLink = page['@odata.nextLink'] ?? null;
 
-        logger.info(`[Purview] Page returned ${records.length} record(s). hasMore=${responseNextLink !== null}`);
+        logger.info(
+          `[Purview] Page returned ${records.length} record(s). hasMore=${responseNextLink !== null}`
+        );
 
         return {
           content: [
@@ -197,10 +214,12 @@ Uses the /beta API endpoint as this feature is not available in v1.0.`,
       if (params.keywordFilter) body.keywordFilter = params.keywordFilter;
       if (params.serviceFilter) body.serviceFilter = params.serviceFilter;
       if (params.operationFilters?.length) body.operationFilters = params.operationFilters;
-      if (params.userPrincipalNameFilters?.length) body.userPrincipalNameFilters = params.userPrincipalNameFilters;
+      if (params.userPrincipalNameFilters?.length)
+        body.userPrincipalNameFilters = params.userPrincipalNameFilters;
       if (params.ipAddressFilters?.length) body.ipAddressFilters = params.ipAddressFilters;
       if (params.objectIdFilters?.length) body.objectIdFilters = params.objectIdFilters;
-      if (params.administrativeUnitIdFilters?.length) body.administrativeUnitIdFilters = params.administrativeUnitIdFilters;
+      if (params.administrativeUnitIdFilters?.length)
+        body.administrativeUnitIdFilters = params.administrativeUnitIdFilters;
 
       logger.info('[Purview] Mode 1 — creating audit log query...');
 
@@ -249,7 +268,9 @@ Uses the /beta API endpoint as this feature is not available in v1.0.`,
           status = statusData.status;
         } catch (error) {
           logger.error(`[Purview] Failed to poll query status: ${(error as Error).message}`);
-          return errorResult(`Failed to poll audit log query status: ${(error as Error).message}`, { queryId });
+          return errorResult(`Failed to poll audit log query status: ${(error as Error).message}`, {
+            queryId,
+          });
         }
 
         logger.info(`[Purview] Query status: ${status}`);
@@ -274,7 +295,9 @@ Uses the /beta API endpoint as this feature is not available in v1.0.`,
       const records = page.value ?? [];
       const nextLink = page['@odata.nextLink'] ?? null;
 
-      logger.info(`[Purview] First page: ${records.length} record(s). hasMore=${nextLink !== null}`);
+      logger.info(
+        `[Purview] First page: ${records.length} record(s). hasMore=${nextLink !== null}`
+      );
 
       return {
         content: [
