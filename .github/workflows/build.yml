@@ -36,6 +36,9 @@ jobs:
 
       - name: Check formatting
         run: npm run format:check
+      
+      - name: Check Vulnerabilities
+        run: npm audit --omit=dev
 
       - name: Build TypeScript
         run: npm run build
