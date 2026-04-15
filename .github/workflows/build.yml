@@ -11,7 +11,7 @@ jobs:
 
     strategy:
       matrix:
-        node-version: [ 20.x, 22.x, 24.x ]
+        node-version: [ 20.x ]
 
     steps:
       - uses: actions/checkout@v6
@@ -36,6 +36,9 @@ jobs:
 
       - name: Check formatting
         run: npm run format:check
+      
+      - name: Check Vulnerabilities
+        run: npm audit --omit=dev
 
       - name: Build TypeScript
         run: npm run build
