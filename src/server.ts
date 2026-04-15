@@ -6,6 +6,7 @@ import express, { Request, Response } from 'express';
 import logger, { enableConsoleLogging } from './logger.js';
 import { registerAuthTools } from './auth-tools.js';
 import { registerGraphTools, registerDiscoveryTools } from './graph-tools.js';
+import { registerPurviewAuditTools } from './purview-audit-tools.js';
 import GraphClient from './graph-client.js';
 import AuthManager, { buildScopesFromEndpoints } from './auth.js';
 import { MicrosoftOAuthProvider } from './oauth-provider.js';
@@ -95,6 +96,8 @@ class MicrosoftGraphServer {
         this.options.orgMode
       );
     }
+
+    registerPurviewAuditTools(this.server, this.graphClient);
   }
 
   async start(): Promise<void> {
