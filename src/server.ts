@@ -7,6 +7,8 @@ import logger, { enableConsoleLogging } from './logger.js';
 import { registerAuthTools } from './auth-tools.js';
 import { registerGraphTools, registerDiscoveryTools } from './graph-tools.js';
 import { registerPurviewAuditTools } from './purview-audit-tools.js';
+import { registerDynamicsCaseMgmtTools } from './dynamics-case-mgmt-tools.js';
+import { DataverseClient } from './dataverse-client.js';
 import GraphClient from './graph-client.js';
 import AuthManager, { buildScopesFromEndpoints } from './auth.js';
 import { MicrosoftOAuthProvider } from './oauth-provider.js';
@@ -98,6 +100,16 @@ class MicrosoftGraphServer {
     }
 
     registerPurviewAuditTools(this.server, this.graphClient);
+
+    // Dynamics 365 Customer Service case-management tools — opt-in via D365_URL env
+    // (or --dynamics-url CLI option). Auth piggybacks on the signed-in MSAL account.
+    const dynamicsUrl =
+      (this.options.dynamicsUrl as string | undefined) ?? process.env.D365_URL ?? undefined;
+    if (dynamicsUrl) {
+      const dv = new DataverseClient(this.authManager, dynamicsUrl);
+      registerDynamicsCaseMgmtTools(this.server, dv, !!this.options.readOnly);
+      logger.info(`Registered Dynamics 365 case-management tools for ${dv.getOrgUrl()}`);
+    }
   }
 
   async start(): Promise<void> {

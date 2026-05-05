@@ -37,7 +37,7 @@ program
   )
   .option(
     '--preset <names>',
-    'Use preset tool categories (comma-separated). Available: mail, calendar, files, personal, work, excel, contacts, tasks, onenote, search, users, all'
+    'Use preset tool categories (comma-separated). Available: mail, calendar, files, personal, work, excel, contacts, tasks, onenote, search, users, case-mgmt, all'
   )
   .option('--list-presets', 'List all available presets and exit')
   .option(
@@ -52,6 +52,11 @@ program
   .option(
     '--enable-dynamic-registration',
     'Enable OAuth Dynamic Client Registration endpoint (required for some MCP clients like Open WebUI)'
+  )
+  .option(
+    '--dynamics-url <url>',
+    'Dynamics 365 org URL (e.g. https://contoso.crm.dynamics.com). When set, registers ' +
+      'the dynamics-case-mgmt-* tools and adds the Dataverse scope to sign-in. Env var: D365_URL.'
   );
 
 export interface CommandOptions {
@@ -75,6 +80,7 @@ export interface CommandOptions {
   discovery?: boolean;
   cloud?: string;
   enableDynamicRegistration?: boolean;
+  dynamicsUrl?: string;
 
   [key: string]: unknown;
 }
@@ -136,6 +142,11 @@ export function parseArgs(): CommandOptions {
   // Handle cloud type - CLI option takes precedence over environment variable
   if (options.cloud) {
     process.env.MS365_MCP_CLOUD_TYPE = options.cloud;
+  }
+
+  // Dynamics 365: env var falls back to CLI flag for non-interactive deployments.
+  if (!options.dynamicsUrl && process.env.D365_URL) {
+    options.dynamicsUrl = process.env.D365_URL;
   }
 
   return options;

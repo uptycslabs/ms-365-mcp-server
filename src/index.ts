@@ -17,6 +17,16 @@ async function main(): Promise<void> {
     }
 
     const scopes = buildScopesFromEndpoints(includeWorkScopes, args.enabledTools);
+
+    // If Dynamics 365 is enabled, ask for its Dataverse scope at sign-in time
+    // so MSAL can later mint Dataverse tokens silently for the same account.
+    const dynamicsUrl = (args.dynamicsUrl as string | undefined) ?? process.env.D365_URL;
+    if (dynamicsUrl) {
+      const trimmed = dynamicsUrl.replace(/\/$/, '');
+      scopes.push(`${trimmed}/.default`);
+      logger.info(`Dynamics 365 enabled — added Dataverse scope for ${trimmed}`);
+    }
+
     const authManager = await AuthManager.create(scopes);
     await authManager.loadTokenCache();
 

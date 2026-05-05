@@ -65,6 +65,11 @@ export const TOOL_CATEGORIES: Record<string, ToolCategory> = {
     description: 'User directory access',
     requiresOrgMode: true,
   },
+  'case-mgmt': {
+    name: 'case-mgmt',
+    pattern: /dynamics-case-mgmt/i,
+    description: 'Dynamics 365 Customer Service case management (requires --dynamics-url)',
+  },
   all: {
     name: 'all',
     pattern: /.*/,

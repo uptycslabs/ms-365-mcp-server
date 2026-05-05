@@ -150,6 +150,29 @@ send-shared-mailbox-mail</sub>
 **User Management**  
 <sub>list-users</sub>
 
+### Dynamics 365 Customer Service (Requires --dynamics-url or D365_URL env var)
+
+**Case Management**  
+<sub>dynamics-case-mgmt-whoami, dynamics-case-mgmt-list-queue-cases, dynamics-case-mgmt-get-case,
+dynamics-case-mgmt-search-cases, dynamics-case-mgmt-pick-from-queue, dynamics-case-mgmt-add-note,
+dynamics-case-mgmt-update-case, dynamics-case-mgmt-resolve-case</sub>
+
+These tools talk directly to the Dataverse Web API (`/api/data/v9.2`) on your D365 org. Auth piggybacks on
+the signed-in MSAL account, so the user must have a corresponding D365 user with appropriate security roles
+(e.g. Customer Service Representative + PickFromQueue privilege).
+
+Enable by passing `--dynamics-url https://<org>.crm.dynamics.com` (or setting `D365_URL`). After adding the
+URL, re-run `--login` once so MSAL acquires consent for the Dataverse scope. Use `--read-only` to expose only
+the four read tools (`whoami`, `list-queue-cases`, `get-case`, `search-cases`).
+
+Gotchas:
+
+- `pick-from-queue` takes the **queueitem GUID**, not the incident GUID — `list-queue-cases` returns both.
+- `update-case` refuses `statecode`. To close a case, use `resolve-case`, which goes through the
+  `CloseIncident` action and creates an `incidentresolution` activity.
+- `status_code` defaults to `5` (Problem Solved, OOB). If your org has customized the option set, pass your
+  org's value explicitly.
+
 ## Organization/Work Mode
 
 To access work/school features (Teams, SharePoint, etc.), enable organization mode using any of these flags:

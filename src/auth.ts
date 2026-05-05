@@ -364,6 +364,38 @@ class AuthManager {
     throw new Error('No valid token found');
   }
 
+  /**
+   * Acquire a token for an arbitrary set of scopes (e.g. a Dataverse Web API scope
+   * like `https://contoso.crm.dynamics.com/.default`) using the currently selected
+   * MSAL account. The scopes must have been consented during sign-in for silent
+   * acquisition to succeed.
+   */
+  async acquireTokenForScopes(scopes: string[]): Promise<string> {
+    if (this.isOAuthMode && this.oauthToken) {
+      // BYOT mode: caller provided a static token. We can't mint a different
+      // scope from it — return as-is and let the API decide.
+      return this.oauthToken;
+    }
+
+    const account = await this.getCurrentAccount();
+    if (!account) {
+      throw new Error('No signed-in account; run `--login` first.');
+    }
+
+    try {
+      const response = await this.msalApp.acquireTokenSilent({ account, scopes });
+      return response.accessToken;
+    } catch (error) {
+      logger.error(
+        `Silent token acquisition failed for scopes [${scopes.join(', ')}]: ${(error as Error).message}`
+      );
+      throw new Error(
+        `Silent token acquisition failed for scopes [${scopes.join(', ')}]. ` +
+          `If this is a new scope, sign in again with --login so MSAL can request consent.`
+      );
+    }
+  }
+
   async getCurrentAccount(): Promise<AccountInfo | null> {
     const accounts = await this.msalApp.getTokenCache().getAllAccounts();
 
