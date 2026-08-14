@@ -3,37 +3,213 @@ import logger from '../logger.js';
 import { getCloudEndpoints, type CloudType } from '../cloud-config.js';
 
 /**
- * Microsoft Bearer Token Auth Middleware validates that the request has a valid Microsoft access token
- * The token is passed in the Authorization header as a Bearer token
+ * Build the resource_metadata URL per RFC 9728 §3.1.
+ * (https://www.rfc-editor.org/rfc/rfc9728.html#name-protected-resource-metadata-)
+ *
+ * When the resource identifier has a path component that should be seen as the resource path.
+ * And thus be inserted in the end of the well-known URI.
+ *
+ *   https://example.com                   → https://example.com/.well-known/oauth-protected-resource
+ *   https://example.com/tenant/ms-365-mcp → https://example.com/.well-known/oauth-protected-resource/tenant/ms-365-mcp
+ *
+ * When publicUrl is absent the request Host
+ * header is used as the origin and no additional path component is appended.
  */
-export const microsoftBearerTokenAuthMiddleware = (
-  req: Request & { microsoftAuth?: { accessToken: string; refreshToken: string } },
-  res: Response,
-  next: NextFunction
-): void => {
-  const authHeader = req.headers.authorization;
-
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    res.status(401).json({ error: 'Missing or invalid access token' });
-    return;
+function buildResourceMetadataUrl(req: Request, publicUrl?: string | null): string {
+  if (publicUrl) {
+    const parsed = new URL(publicUrl);
+    // If the resource identifier value contains a path or query component,
+    // any terminating slash (/) following the host component MUST be removed
+    // before inserting /.well-known/ and the well-known URI path suffix
+    // between the host component and the path and/or query components
+    const path = parsed.pathname.replace(/\/$/, '');
+    return `${parsed.origin}/.well-known/oauth-protected-resource${path}`;
   }
+  const protocol = req.secure ? 'https' : 'http';
+  const origin = `${protocol}://${req.get('host')}`;
+  return `${origin}/.well-known/oauth-protected-resource`;
+}
 
-  const accessToken = authHeader.substring(7);
+function buildWwwAuthenticate(
+  req: Request,
+  error: string,
+  description: string,
+  publicUrl?: string | null
+): string {
+  const resourceMetadata = buildResourceMetadataUrl(req, publicUrl);
+  return `Bearer resource_metadata="${resourceMetadata}", error="${error}", error_description="${description}"`;
+}
 
-  // For Microsoft Graph, we don't validate the token here - we'll let the API calls fail if it's invalid
-  // and handle token refresh in the GraphClient
+// Returns true only for JWTs whose exp claim is in the past.
+// Opaque tokens (e.g. MSA compact tokens) and tokens without exp return false
+// and are passed through for Graph to validate.
+function isJwtExpired(token: string): boolean {
+  const parts = token.split('.');
+  if (parts.length !== 3) return false;
+  try {
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf-8'));
+    if (typeof payload.exp !== 'number') return false;
+    return payload.exp * 1000 < Date.now();
+  } catch {
+    return false;
+  }
+}
 
-  // Extract refresh token from a custom header (if provided)
-  const refreshToken = (req.headers['x-microsoft-refresh-token'] as string) || '';
+const DISCOVERY_METHODS = new Set([
+  'initialize',
+  'notifications/initialized',
+  'tools/list',
+  'prompts/list',
+  'resources/list',
+  'ping',
+]);
 
-  // Store tokens in request for later use
-  req.microsoftAuth = {
-    accessToken,
-    refreshToken,
+function isDiscoveryRequest(req: Request): boolean {
+  if (req.method !== 'POST' || !req.body) return false;
+  const body = req.body;
+  if (Array.isArray(body)) {
+    return body.every((item) => DISCOVERY_METHODS.has(item?.method));
+  }
+  return DISCOVERY_METHODS.has(body?.method);
+}
+
+/**
+ * Microsoft Bearer Token Auth Middleware validates that the request has a valid Microsoft access token.
+ * Returns HTTP 401 + WWW-Authenticate on missing or expired tokens so spec-compliant MCP clients
+ * refresh via the /token endpoint. Opaque tokens fall through and are validated by Graph.
+ *
+ * When `trustProxyAuth` is true the bearer check is skipped — an upstream
+ * reverse proxy is presumed to have authenticated the caller, and Microsoft
+ * Graph access falls back to the locally cached MSAL refresh token via
+ * AuthManager (the same path stdio mode uses).
+ *
+ * When `allowUnauthenticatedDiscovery` is true, discovery requests (initialize,
+ * tools/list, etc.) are allowed without a token so that MCP gateways can
+ * register the available tools before any user has authenticated. It is off by
+ * default; non-discovery requests (e.g. tools/call) always still require a token.
+ */
+export const microsoftBearerTokenAuthMiddleware =
+  (
+    opts: {
+      trustProxyAuth?: boolean;
+      allowUnauthenticatedDiscovery?: boolean;
+      publicUrl?: string | null;
+    } = {}
+  ) =>
+  (
+    req: Request & { microsoftAuth?: { accessToken: string } },
+    res: Response,
+    next: NextFunction
+  ): void => {
+    if (opts.trustProxyAuth) {
+      next();
+      return;
+    }
+
+    const authHeader = req.headers.authorization;
+
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      if (opts.allowUnauthenticatedDiscovery && isDiscoveryRequest(req)) {
+        next();
+        return;
+      }
+      res
+        .status(401)
+        .set(
+          'WWW-Authenticate',
+          buildWwwAuthenticate(
+            req,
+            'invalid_token',
+            'Missing or malformed Authorization header',
+            opts.publicUrl
+          )
+        )
+        .json({
+          error: 'invalid_token',
+          error_description: 'Missing or malformed Authorization header',
+        });
+      return;
+    }
+
+    const accessToken = authHeader.substring(7);
+
+    if (isJwtExpired(accessToken)) {
+      res
+        .status(401)
+        .set(
+          'WWW-Authenticate',
+          buildWwwAuthenticate(req, 'invalid_token', 'The access token has expired', opts.publicUrl)
+        )
+        .json({ error: 'invalid_token', error_description: 'The access token has expired' });
+      return;
+    }
+
+    req.microsoftAuth = { accessToken };
+
+    next();
   };
 
-  next();
-};
+export interface UpstreamOAuthErrorBody {
+  error: string;
+  error_description?: string;
+  error_codes?: number[];
+  suberror?: string;
+  trace_id?: string;
+  correlation_id?: string;
+  timestamp?: string;
+}
+
+export class OAuthUpstreamError extends Error {
+  readonly status: number;
+  readonly body: UpstreamOAuthErrorBody;
+  readonly raw: string;
+
+  constructor(status: number, raw: string, body: UpstreamOAuthErrorBody) {
+    const suffix = body.error_description ? ` - ${body.error_description}` : '';
+    super(`OAuth upstream error: ${body.error}${suffix}`);
+    this.name = 'OAuthUpstreamError';
+    this.status = status;
+    this.body = body;
+    this.raw = raw;
+  }
+}
+
+function parseUpstreamOAuthError(raw: string): UpstreamOAuthErrorBody | null {
+  try {
+    const json = JSON.parse(raw) as unknown;
+    if (
+      json !== null &&
+      typeof json === 'object' &&
+      typeof (json as { error?: unknown }).error === 'string'
+    ) {
+      return json as UpstreamOAuthErrorBody;
+    }
+  } catch {
+    /* not JSON */
+  }
+  return null;
+}
+
+export function toOAuthErrorResponse(error: unknown): {
+  status: number;
+  body: { error: string; error_description?: string; suberror?: string };
+} {
+  if (error instanceof OAuthUpstreamError) {
+    const body: { error: string; error_description?: string; suberror?: string } = {
+      error: error.body.error,
+    };
+    if (error.body.error_description) body.error_description = error.body.error_description;
+    if (error.body.suberror) body.suberror = error.body.suberror;
+    return { status: 400, body };
+  }
+  return {
+    status: 500,
+    body: {
+      error: 'server_error',
+      error_description: 'Internal server error during token exchange',
+    },
+  };
+}
 
 /**
  * Exchange authorization code for access token
@@ -80,9 +256,20 @@ export async function exchangeCodeForToken(
   });
 
   if (!response.ok) {
-    const error = await response.text();
-    logger.error(`Failed to exchange code for token: ${error}`);
-    throw new Error(`Failed to exchange code for token: ${error}`);
+    const raw = await response.text();
+    const parsed = parseUpstreamOAuthError(raw);
+    if (parsed) {
+      logger.warn(`Token endpoint upstream OAuth error: ${parsed.error}`, {
+        status: response.status,
+        error: parsed.error,
+        suberror: parsed.suberror,
+        error_codes: parsed.error_codes,
+        correlation_id: parsed.correlation_id,
+      });
+      throw new OAuthUpstreamError(response.status, raw, parsed);
+    }
+    logger.error(`Failed to exchange code for token: ${raw}`);
+    throw new Error(`Failed to exchange code for token: ${raw}`);
   }
 
   return response.json();
@@ -124,9 +311,20 @@ export async function refreshAccessToken(
   });
 
   if (!response.ok) {
-    const error = await response.text();
-    logger.error(`Failed to refresh token: ${error}`);
-    throw new Error(`Failed to refresh token: ${error}`);
+    const raw = await response.text();
+    const parsed = parseUpstreamOAuthError(raw);
+    if (parsed) {
+      logger.warn(`Token endpoint upstream OAuth error: ${parsed.error}`, {
+        status: response.status,
+        error: parsed.error,
+        suberror: parsed.suberror,
+        error_codes: parsed.error_codes,
+        correlation_id: parsed.correlation_id,
+      });
+      throw new OAuthUpstreamError(response.status, raw, parsed);
+    }
+    logger.error(`Failed to refresh token: ${raw}`);
+    throw new Error(`Failed to refresh token: ${raw}`);
   }
 
   return response.json();

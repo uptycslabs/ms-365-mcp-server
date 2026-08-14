@@ -1,11 +1,12 @@
 import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import AuthManager from './auth.js';
+import { getRequestTokens } from './request-context.js';
 
 export function registerAuthTools(server: McpServer, authManager: AuthManager): void {
   server.tool(
     'login',
-    'Authenticate with Microsoft using device code flow',
+    'Authenticate with Microsoft account',
     {
       force: z.boolean().default(false).describe('Force a new login even if already logged in'),
     },
@@ -26,6 +27,22 @@ export function registerAuthTools(server: McpServer, authManager: AuthManager): 
               ],
             };
           }
+        }
+
+        if (authManager.getUseInteractiveAuth()) {
+          await authManager.acquireTokenInteractive();
+          const loginResult = await authManager.testLogin();
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({
+                  status: 'Login successful',
+                  ...loginResult,
+                }),
+              },
+            ],
+          };
         }
 
         const text = await new Promise<string>((resolve, reject) => {
@@ -79,7 +96,15 @@ export function registerAuthTools(server: McpServer, authManager: AuthManager): 
   });
 
   server.tool('verify-login', 'Check current Microsoft authentication status', {}, async () => {
-    const testResult = await authManager.testLogin();
+    let testResult: Awaited<ReturnType<AuthManager['testLogin']>>;
+    try {
+      testResult = await authManager.testLogin();
+    } catch (error) {
+      testResult = {
+        success: false,
+        message: `Login failed: ${(error as Error).message}`,
+      };
+    }
 
     return {
       content: [
@@ -91,65 +116,78 @@ export function registerAuthTools(server: McpServer, authManager: AuthManager): 
     };
   });
 
-  server.tool('list-accounts', 'List all available Microsoft accounts', {}, async () => {
-    try {
-      const accounts = await authManager.listAccounts();
-      const selectedAccountId = authManager.getSelectedAccountId();
-      const result = accounts.map((account) => ({
-        id: account.homeAccountId,
-        username: account.username,
-        name: account.name,
-        selected: account.homeAccountId === selectedAccountId,
-      }));
+  server.tool(
+    'list-accounts',
+    'List all Microsoft accounts configured in this server. Use this to discover available account emails before making tool calls. Reflects accounts added mid-session via --login.',
+    {},
+    {
+      title: 'list-accounts',
+      readOnlyHint: true,
+      openWorldHint: false,
+    },
+    async () => {
+      try {
+        const accounts = await authManager.listAccounts();
+        const selectedAccountId = authManager.getSelectedAccountId();
+        const pinnedMode = authManager.hasExpectedAccount();
+        // OAuth bearer requests always use the connecting client's identity, so
+        // cached accounts are not reachable via the account parameter (discussion #467).
+        const oauthBearerMode = authManager.isOAuthModeEnabled() || Boolean(getRequestTokens());
+        const result = accounts.map((account) => ({
+          email: account.username || 'unknown',
+          name: account.name,
+          isDefault: account.homeAccountId === selectedAccountId,
+        }));
 
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({ accounts: result }),
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({ error: `Failed to list accounts: ${(error as Error).message}` }),
-          },
-        ],
-      };
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                accounts: result,
+                count: result.length,
+                tip: pinnedMode
+                  ? 'Expected account pinning is configured; account parameters are disabled.'
+                  : oauthBearerMode
+                    ? "This server is in HTTP/OAuth mode: every request uses the identity of the connecting client's bearer token. The cached accounts listed here cannot be targeted via the 'account' parameter; reconnect the MCP client as the desired account instead."
+                    : "Pass the 'email' value as the 'account' parameter in any tool call to target a specific account.",
+              }),
+            },
+          ],
+        };
+      } catch (error) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                error: `Failed to list accounts: ${(error as Error).message}`,
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
     }
-  });
+  );
 
   server.tool(
     'select-account',
-    'Select a specific Microsoft account to use',
+    'Select a Microsoft account as the default. Accepts email address (e.g. user@outlook.com) or account ID. Use list-accounts to discover available accounts.',
     {
-      accountId: z.string().describe('The account ID to select'),
+      account: z.string().describe('Email address or account ID of the account to select'),
     },
-    async ({ accountId }) => {
+    async ({ account }) => {
       try {
-        const success = await authManager.selectAccount(accountId);
-        if (success) {
-          return {
-            content: [
-              {
-                type: 'text',
-                text: JSON.stringify({ message: `Selected account: ${accountId}` }),
-              },
-            ],
-          };
-        } else {
-          return {
-            content: [
-              {
-                type: 'text',
-                text: JSON.stringify({ error: `Account not found: ${accountId}` }),
-              },
-            ],
-          };
-        }
+        await authManager.selectAccount(account);
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({ message: `Selected account: ${account}` }),
+            },
+          ],
+        };
       } catch (error) {
         return {
           content: [
@@ -160,6 +198,7 @@ export function registerAuthTools(server: McpServer, authManager: AuthManager): 
               }),
             },
           ],
+          isError: true,
         };
       }
     }
@@ -167,19 +206,19 @@ export function registerAuthTools(server: McpServer, authManager: AuthManager): 
 
   server.tool(
     'remove-account',
-    'Remove a Microsoft account from the cache',
+    'Remove a Microsoft account from the cache. Accepts email address (e.g. user@outlook.com) or account ID. Use list-accounts to discover available accounts.',
     {
-      accountId: z.string().describe('The account ID to remove'),
+      account: z.string().describe('Email address or account ID of the account to remove'),
     },
-    async ({ accountId }) => {
+    async ({ account }) => {
       try {
-        const success = await authManager.removeAccount(accountId);
+        const success = await authManager.removeAccount(account);
         if (success) {
           return {
             content: [
               {
                 type: 'text',
-                text: JSON.stringify({ message: `Removed account: ${accountId}` }),
+                text: JSON.stringify({ message: `Removed account: ${account}` }),
               },
             ],
           };
@@ -188,9 +227,10 @@ export function registerAuthTools(server: McpServer, authManager: AuthManager): 
             content: [
               {
                 type: 'text',
-                text: JSON.stringify({ error: `Account not found: ${accountId}` }),
+                text: JSON.stringify({ error: `Failed to remove account from cache: ${account}` }),
               },
             ],
+            isError: true,
           };
         }
       } catch (error) {
@@ -203,6 +243,7 @@ export function registerAuthTools(server: McpServer, authManager: AuthManager): 
               }),
             },
           ],
+          isError: true,
         };
       }
     }
