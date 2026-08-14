@@ -848,6 +848,35 @@ function lenientBodySchema(schema: z.ZodTypeAny): z.ZodTypeAny {
   return schema;
 }
 
+// Graph types requests[].size and requests[].from on /search/query as numbers, but models
+// routinely send them as strings ("25"). Zod rejects that with MCP -32602, and because the
+// error carries no retry semantics the model re-sends the identical payload — observed 8
+// times in one investigation before it gave up and dropped the field.
+//
+// Only a string that is wholly a finite integer is converted; anything else is passed
+// through untouched so a genuine shape mistake still fails loudly. Applied to search-query
+// alone (see registration below), so no other tool's validation changes.
+export function coerceSearchRequestNumbers(value: unknown): unknown {
+  if (!isPlainObject(value) || !Array.isArray(value.requests)) {
+    return value;
+  }
+
+  const asNumber = (v: unknown): unknown => {
+    if (typeof v !== 'string' || !/^\d+$/.test(v.trim())) {
+      return v;
+    }
+    const n = Number(v);
+    return Number.isSafeInteger(n) ? n : v;
+  };
+
+  return {
+    ...value,
+    requests: value.requests.map((req) =>
+      isPlainObject(req) ? { ...req, size: asNumber(req.size), from: asNumber(req.from) } : req
+    ),
+  };
+}
+
 // Read-only in Graph - merging an echoed id/timestamp into a POST/PATCH body can 400
 const READ_ONLY_BODY_FIELDS = new Set([
   'id',
@@ -1549,6 +1578,13 @@ export function registerGraphTools(
             ? lenientBodySchema(param.schema as z.ZodTypeAny)
             : param.schema || z.any();
       }
+    }
+
+    // z.preprocess leaves the ADVERTISED schema as the inner one, so tools/list still
+    // tells the model these fields are numbers — the coercion is a safety net for when
+    // it sends "25" anyway, not a licence to send strings.
+    if (tool.alias === 'search-query' && paramSchema['body']) {
+      paramSchema['body'] = z.preprocess(coerceSearchRequestNumbers, paramSchema['body']);
     }
 
     // Extract path parameters from the path pattern (e.g., :todoTaskListId from /me/todo/lists/:todoTaskListId/tasks)
