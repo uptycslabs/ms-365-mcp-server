@@ -2,17 +2,62 @@ import winston from 'winston';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
+import os from 'os';
+import { redactionEnabled, redactSensitive } from './lib/log-redactor.js';
+
+// PII/secret redaction (MS365_MCP_REDACT_PII), on by default. Runs before
+// the printf so both file and console transports emit scrubbed messages.
+// Set MS365_MCP_REDACT_PII=false to opt out and get fully verbose logs.
+const redactFormat = winston.format((info) => {
+  if (!redactionEnabled()) return info;
+  if (typeof info.message === 'string') {
+    info.message = redactSensitive(info.message);
+  }
+  return info;
+});
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const logsDir = path.join(__dirname, '..', 'logs');
+const logsDir =
+  process.env.MS365_MCP_LOG_DIR || path.join(os.homedir(), '.ms-365-mcp-server', 'logs');
 
 if (!fs.existsSync(logsDir)) {
-  fs.mkdirSync(logsDir);
+  fs.mkdirSync(logsDir, { recursive: true, mode: 0o700 });
+} else {
+  // Tighten permissions on a pre-existing log directory in case it was created
+  // with a more permissive umask.
+  try {
+    fs.chmodSync(logsDir, 0o700);
+  } catch {
+    // Best-effort — on platforms that don't support chmod (e.g. Windows) this
+    // is a no-op.
+  }
 }
+
+// Restrict log file mode to owner-only (0o600). Log files may contain error
+// messages from upstream libraries (MSAL, fetch, etc.) which can incidentally
+// include token fragments or other sensitive material; on shared/multi-user
+// systems the default umask may otherwise leave them world-readable.
+const FILE_MODE = 0o600;
+
+function ensureFileMode(filePath: string): void {
+  try {
+    if (fs.existsSync(filePath)) {
+      fs.chmodSync(filePath, FILE_MODE);
+    }
+  } catch {
+    // Best-effort — chmod is unsupported on some platforms (e.g. Windows).
+  }
+}
+
+const errorLogPath = path.join(logsDir, 'error.log');
+const serverLogPath = path.join(logsDir, 'mcp-server.log');
+ensureFileMode(errorLogPath);
+ensureFileMode(serverLogPath);
 
 const logger = winston.createLogger({
   level: process.env.LOG_LEVEL || 'info',
   format: winston.format.combine(
+    redactFormat(),
     winston.format.timestamp({
       format: 'YYYY-MM-DD HH:mm:ss',
     }),
@@ -22,11 +67,13 @@ const logger = winston.createLogger({
   ),
   transports: [
     new winston.transports.File({
-      filename: path.join(logsDir, 'error.log'),
+      filename: errorLogPath,
       level: 'error',
+      options: { flags: 'a', mode: FILE_MODE },
     }),
     new winston.transports.File({
-      filename: path.join(logsDir, 'mcp-server.log'),
+      filename: serverLogPath,
+      options: { flags: 'a', mode: FILE_MODE },
     }),
   ],
 });
@@ -34,7 +81,11 @@ const logger = winston.createLogger({
 export const enableConsoleLogging = (): void => {
   logger.add(
     new winston.transports.Console({
-      format: winston.format.combine(winston.format.colorize(), winston.format.simple()),
+      format: winston.format.combine(
+        redactFormat(),
+        winston.format.colorize(),
+        winston.format.simple()
+      ),
       silent: process.env.SILENT === 'true' || process.env.SILENT === '1',
     })
   );

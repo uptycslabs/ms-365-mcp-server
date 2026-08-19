@@ -1,16 +1,128 @@
 import fs from 'fs';
 import yaml from 'js-yaml';
 
-export function createAndSaveSimplifiedOpenAPI(endpointsFile, openapiFile, openapiTrimmedFile) {
+export function createAndSaveSimplifiedOpenAPI(
+  endpointsFile,
+  openapiFile,
+  openapiTrimmedFile,
+  apiVersion = 'v1.0'
+) {
   const allEndpoints = JSON.parse(fs.readFileSync(endpointsFile, 'utf8'));
-  const endpoints = allEndpoints.filter((endpoint) => !endpoint.disabled);
+  // Each spec is trimmed against only the endpoints targeting its version. Entries
+  // without an explicit apiVersion default to v1.0, so existing endpoints are unchanged.
+  const endpoints = allEndpoints.filter(
+    (endpoint) => !endpoint.disabled && (endpoint.apiVersion ?? 'v1.0') === apiVersion
+  );
 
   const spec = fs.readFileSync(openapiFile, 'utf8');
   const openApiSpec = yaml.load(spec);
 
+  // Synthesize paths that the Graph REST API supports but are missing from
+  // Microsoft's published OpenAPI metadata (e.g. range(address='{address}')/format
+  // — documented in Excel API but not in the OpenAPI spec).
   for (const endpoint of endpoints) {
     if (!openApiSpec.paths[endpoint.pathPattern]) {
-      throw new Error(`Path "${endpoint.pathPattern}" not found in OpenAPI spec.`);
+      openApiSpec.paths[endpoint.pathPattern] = {};
+    }
+  }
+
+  // Two cases handled here:
+  //  1. The method is missing entirely (Microsoft never published this operation):
+  //     synthesize the whole operation from endpoints.json.
+  //  2. The method exists but the endpoint declares its own requestBodySchema
+  //     (Microsoft published a deprecated/malformed/private-preview body our generator
+  //     can't consume): override ONLY the request body and keep Microsoft's published
+  //     responses/parameters intact, so we don't silently drop upstream fields or mask
+  //     a future upstream fix. requestBodySchema is explicit opt-in per endpoint.
+  for (const endpoint of endpoints) {
+    const pathSpec = openApiSpec.paths[endpoint.pathPattern];
+    const methodLower = endpoint.method.toLowerCase();
+    if (!pathSpec) continue;
+
+    const operationMissing = !pathSpec[methodLower];
+    const overrideBodyOnly =
+      !operationMissing &&
+      endpoint.requestBodySchema &&
+      methodLower !== 'get' &&
+      methodLower !== 'delete';
+
+    if (operationMissing) {
+      const pathParamMatches = [...endpoint.pathPattern.matchAll(/\{([^}]+)\}/g)].map((m) => m[1]);
+      const synthesizedParameters = pathParamMatches.map((paramName) => ({
+        name: paramName,
+        in: 'path',
+        required: true,
+        description: `Path parameter: ${paramName}`,
+        schema: { type: 'string' },
+      }));
+      // The fallback used to be the llmTip, then the tool name itself, which reached the
+      // model as the whole description ("update-sharepoint-site-onenote-page-content
+      // (synthesized)"). Prefer a real sentence built from the same name.
+      //
+      // The synthesized sentence goes ahead of the llmTip on purpose: graph-tools appends
+      // the llmTip to the description at registration, so using it here too shipped it
+      // twice in the same tool description. The llmTip stays as the fallback for the tool
+      // names with no verb to synthesize from (graph-batch).
+      const synthesizedDescription =
+        synthesizeDescriptionFromToolName(endpoint.toolName) ||
+        endpoint.llmTip ||
+        `${endpoint.toolName} (synthesized)`;
+      pathSpec[methodLower] = {
+        tags: ['drives.driveItem'],
+        summary: synthesizedDescription,
+        description: synthesizedDescription,
+        operationId: endpoint.toolName,
+        parameters: synthesizedParameters,
+        requestBody:
+          methodLower === 'get' || methodLower === 'delete'
+            ? undefined
+            : {
+                description: 'Operation payload',
+                required: true,
+                content: {
+                  'application/json': {
+                    // When an endpoint declares a typed body schema in endpoints.json
+                    // (for APIs Microsoft hasn't published in its OpenAPI metadata),
+                    // use it so the generated client gets a validated `body` param.
+                    // Otherwise fall back to a permissive object.
+                    schema: endpoint.requestBodySchema ?? {
+                      type: 'object',
+                      additionalProperties: true,
+                    },
+                  },
+                },
+              },
+        responses: {
+          '2XX': {
+            description: 'Success',
+            content: {
+              'application/json': {
+                schema: { type: 'object', additionalProperties: true },
+              },
+            },
+          },
+          '4XX': { $ref: '#/components/responses/error' },
+          '5XX': { $ref: '#/components/responses/error' },
+        },
+      };
+    } else if (overrideBodyOnly) {
+      // Surgical override: replace only the request body, leaving Microsoft's
+      // published responses and parameters for this operation untouched.
+      pathSpec[methodLower].requestBody = {
+        description: pathSpec[methodLower].requestBody?.description || 'Operation payload',
+        required: true,
+        content: {
+          'application/json': {
+            schema: endpoint.requestBodySchema,
+          },
+        },
+      };
+      // These operations are often published as deprecated/private-preview, which
+      // openapi-zod-client skips by default. Declaring a requestBodySchema means we
+      // deliberately vouch for the endpoint, so clear the deprecation markers to keep
+      // it in the generated client.
+      delete pathSpec[methodLower].deprecated;
+      delete pathSpec[methodLower]['x-ms-deprecation'];
     }
   }
 
@@ -26,6 +138,7 @@ export function createAndSaveSimplifiedOpenAPI(endpointsFile, openapiFile, opena
           if (!operation.description && operation.summary) {
             operation.description = operation.summary;
           }
+          operation.description = replaceNavPropertyStub(operation.description, eo.toolName);
           if (operation.parameters) {
             operation.parameters = operation.parameters.map((param) => {
               if (param.$ref && param.$ref.startsWith('#/components/parameters/')) {
@@ -45,6 +158,10 @@ export function createAndSaveSimplifiedOpenAPI(endpointsFile, openapiFile, opena
     }
   }
 
+  if (apiVersion === 'beta') {
+    normalizeWildcardSuccessResponses(openApiSpec.paths);
+  }
+
   if (openApiSpec.components && openApiSpec.components.schemas) {
     removeODataTypeRecursively(openApiSpec.components.schemas);
     flattenComplexSchemasRecursively(openApiSpec.components.schemas);
@@ -60,6 +177,170 @@ export function createAndSaveSimplifiedOpenAPI(endpointsFile, openapiFile, opena
   pruneUnusedSchemas(openApiSpec, usedSchemas);
 
   fs.writeFileSync(openapiTrimmedFile, yaml.dump(openApiSpec));
+}
+
+// Microsoft's spec is generated from CSDL, so operations that are plain CRUD over a
+// navigation property never get prose. They get scaffolding naming the property and its
+// parent instead - "Create new navigation property to messages for users" - which
+// describes neither the operation nor the resource it acts on. Actions and functions get
+// the same treatment in a different shape ("Invoke action setReaction"). That string is
+// what the model sees as the tool description.
+//
+// Only these prose-free shapes are replaced, and each is anchored at both ends so a stub
+// prefix followed by real text is never swallowed. Descriptions carrying real prose are
+// left alone, including the ones that describe the property rather than the operation
+// ("The messages in a mailbox or folder. Read-only. Nullable."): those are the wrong
+// subject but often carry detail worth keeping, and descriptionOverride is the right tool
+// when they aren't.
+const NAV_PROPERTY_STUB =
+  /^(?:Create new navigation property(?: to \S+)?(?: for \S+)?|Update the navigation property \S+ in \S+|Delete navigation property \S+ for \S+|Get \S+ from \S+|Invoke (?:action|function) \S+)\.?$/i;
+
+// Leading tool-name tokens that read as verbs. The tool name is a better source than the
+// HTTP method: sort-excel-range is a PATCH, and "Update" would lose the point of it.
+// Listed explicitly rather than inferred: an unknown leading token means we leave
+// Microsoft's text alone, which is the safe direction. `copilot` and `graph` are the only
+// tool-name leads that aren't verbs, and both fall out of this map on purpose.
+const TOOL_NAME_VERBS = {
+  accept: 'Accept',
+  add: 'Add',
+  cancel: 'Cancel',
+  clear: 'Clear',
+  copy: 'Copy',
+  create: 'Create',
+  decline: 'Decline',
+  delete: 'Delete',
+  dismiss: 'Dismiss',
+  extract: 'Extract',
+  find: 'Find',
+  format: 'Format',
+  forward: 'Forward',
+  get: 'Get',
+  insert: 'Insert',
+  list: 'List',
+  merge: 'Merge',
+  move: 'Move',
+  pin: 'Pin',
+  reauthorize: 'Reauthorize',
+  remove: 'Remove',
+  rename: 'Rename',
+  reply: 'Reply to',
+  search: 'Search',
+  send: 'Send',
+  set: 'Set',
+  share: 'Share',
+  snooze: 'Snooze',
+  sort: 'Sort',
+  unmerge: 'Unmerge',
+  unpin: 'Unpin',
+  unset: 'Unset',
+  update: 'Update',
+  upload: 'Upload',
+};
+
+// Multi-word verbs, matched before the single-token map. Chaining tokens generically
+// would read "Tentatively or accept" for tentatively-accept-event.
+//
+// reply-all has to live here rather than fall through: "all" reads as a possessive lead
+// (see POSSESSIVE_LEADS), so reply-all-mail-message would render "Reply to all mail
+// message" - which says reply to every message in the mailbox, the opposite of what the
+// tool does.
+const COMPOUND_VERBS = {
+  'move-rename': 'Move or rename',
+  'reply-all': 'Reply to all recipients of',
+  'tentatively-accept': 'Tentatively accept',
+};
+
+const PRODUCT_NAMES = {
+  excel: 'Excel',
+  onedrive: 'OneDrive',
+  onenote: 'OneNote',
+  outlook: 'Outlook',
+  planner: 'Planner',
+  sharepoint: 'SharePoint',
+};
+
+// "my calendar permission" already says whose it is.
+const POSSESSIVE_LEADS = new Set(['my', 'your', 'all']);
+
+// Deliberately conservative: a false "singular" only costs an article that reads slightly
+// off, while a false "plural" drops an article the sentence needed. Words like status,
+// series and news end in s without being plural.
+function isPlural(word) {
+  return /s$/i.test(word) && !/(ss|us|is|ews)$/i.test(word);
+}
+
+// Mass nouns take no article: "Send a mail" and "Upload a file content" both read wrong.
+// Only the tail is checked, since that is the noun the article has to agree with - a
+// leading "content" would be a modifier ("content type"), which is countable again.
+const UNCOUNTABLE_TAILS = new Set(['content', 'mail', 'mime', 'delta']);
+
+// Sound, not spelling. OneDrive/OneNote open with a consonant sound, and so does the
+// "yoo" class of u-words (user, unit, unique) - but not upload or update, which really do
+// take "an". Listing the yoo- prefixes is narrower and safer than a blanket /^u/.
+const CONSONANT_SOUNDING_VOWEL = /^(?:one|use|user|uni|uti|ubi|eu)/i;
+
+function articleFor(word) {
+  if (CONSONANT_SOUNDING_VOWEL.test(word)) return 'a ';
+  return /^[aeiou]/i.test(word) ? 'an ' : 'a ';
+}
+
+export function synthesizeDescriptionFromToolName(toolName) {
+  const parts = toolName.split('-');
+
+  let verb = null;
+  const compound = Object.keys(COMPOUND_VERBS).find((prefix) => toolName.startsWith(`${prefix}-`));
+  if (compound) {
+    verb = COMPOUND_VERBS[compound];
+    parts.splice(0, compound.split('-').length);
+  } else if (parts.length > 1 && TOOL_NAME_VERBS[parts[0]]) {
+    verb = TOOL_NAME_VERBS[parts.shift()];
+  }
+  if (!verb) return null;
+
+  // reply-to-chat-message: the verb phrase already ends in that preposition.
+  if (parts[0] === 'to' && verb.endsWith(' to')) parts.shift();
+  if (parts.length === 0) return null;
+
+  const words = parts.map((word) => PRODUCT_NAMES[word] ?? word);
+  // The article is chosen for the head word, so a plural head has to suppress it too -
+  // "a presences by user id" otherwise. The tail matters as well, since that is the noun
+  // the phrase is actually about ("Excel table rows").
+  const skipArticle =
+    verb === 'List' ||
+    POSSESSIVE_LEADS.has(parts[0]) ||
+    isPlural(parts[0]) ||
+    isPlural(parts[parts.length - 1]) ||
+    UNCOUNTABLE_TAILS.has(parts[parts.length - 1]);
+
+  return `${verb} ${skipArticle ? '' : articleFor(words[0])}${words.join(' ')}.`;
+}
+
+export function replaceNavPropertyStub(description, toolName) {
+  if (!description || !NAV_PROPERTY_STUB.test(description.trim())) return description;
+  return synthesizeDescriptionFromToolName(toolName) ?? description;
+}
+
+function normalizeWildcardSuccessResponses(paths) {
+  Object.values(paths || {}).forEach((pathItem) => {
+    if (!pathItem || typeof pathItem !== 'object') return;
+
+    Object.entries(pathItem).forEach(([method, operation]) => {
+      if (!operation || typeof operation !== 'object') return;
+      if (!operation.responses || !operation.responses['2XX']) return;
+
+      const hasConcreteSuccess = Object.keys(operation.responses).some((statusCode) =>
+        /^2\d\d$/.test(statusCode)
+      );
+      if (hasConcreteSuccess) {
+        delete operation.responses['2XX'];
+        return;
+      }
+
+      const successStatus = method === 'post' ? '201' : method === 'delete' ? '204' : '200';
+      operation.responses[successStatus] = operation.responses['2XX'];
+      delete operation.responses['2XX'];
+    });
+  });
 }
 
 function removeODataTypeRecursively(obj) {
@@ -255,6 +536,22 @@ function reduceProperties(schema, schemaName) {
       'enabled',
       'singleValueExtendedProperties',
       'multiValueExtendedProperties',
+      'start',
+      'end',
+      'location',
+      'showAs',
+      'sensitivity',
+      'isAllDay',
+      'importance',
+      'isOnlineMeeting',
+      'isReminderOn',
+      'attendees',
+      'recurrence',
+      'reminderMinutesBeforeStart',
+      'allowNewTimeProposals',
+      'responseRequested',
+      'from',
+      'toRecipients',
     ];
 
     const keptProperties = {};
@@ -442,6 +739,14 @@ function findUsedSchemas(openApiSpec) {
             );
             schemasToProcess.push(schemaName);
           }
+          // Trace refs nested anywhere in an inline request body (e.g. a property's
+          // anyOf: [{$ref}, {nullable object}]). Without this they're pruned as unused,
+          // then stripped as a "broken reference", degrading the body to a bare object.
+          if (content.schema) {
+            findRefsInObject(content.schema, (ref) =>
+              schemasToProcess.push(ref.replace('#/components/schemas/', ''))
+            );
+          }
         });
       }
 
@@ -480,6 +785,12 @@ function findUsedSchemas(openApiSpec) {
                     schemasToProcess.push(schemaName);
                   }
                 });
+              }
+              // Trace refs nested anywhere in an inline response schema.
+              if (content.schema) {
+                findRefsInObject(content.schema, (ref) =>
+                  schemasToProcess.push(ref.replace('#/components/schemas/', ''))
+                );
               }
             });
           }

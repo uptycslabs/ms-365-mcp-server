@@ -1,0 +1,177 @@
+import { describe, it, expect } from 'vitest';
+import {
+  buildScopesFromEndpoints,
+  collapseScopeHierarchy,
+  parseAllowedScopes,
+  resolveAuthScopes,
+} from '../src/auth.js';
+
+describe('buildScopesFromEndpoints', () => {
+  it('returns a non-empty scope set with default arguments', () => {
+    const scopes = buildScopesFromEndpoints();
+    expect(scopes.length).toBeGreaterThan(0);
+    // Scope hierarchy collapses Read into ReadWrite when both endpoints exist.
+    expect(scopes).toContain('Mail.ReadWrite');
+    expect(scopes).not.toContain('Mail.Read');
+  });
+
+  describe('readOnly flag', () => {
+    it('downgrades Mail.ReadWrite to Mail.Read', () => {
+      const scopes = buildScopesFromEndpoints(false, undefined, true);
+      expect(scopes).toContain('Mail.Read');
+      expect(scopes).not.toContain('Mail.ReadWrite');
+    });
+
+    it('excludes scopes that only appear on write endpoints', () => {
+      expect(buildScopesFromEndpoints(false, undefined, false)).toContain('Mail.Send');
+      expect(buildScopesFromEndpoints(false, undefined, true)).not.toContain('Mail.Send');
+    });
+  });
+
+  describe('enabledTools filter', () => {
+    it('narrows the scope set when a pattern is provided', () => {
+      const all = buildScopesFromEndpoints(true, undefined, false);
+      const filtered = buildScopesFromEndpoints(true, 'search|query', false);
+      expect(filtered.length).toBeLessThan(all.length);
+    });
+
+    it('returns an empty array when no tools match the pattern', () => {
+      expect(buildScopesFromEndpoints(true, 'no-such-tool-xyzzy', false)).toEqual([]);
+    });
+  });
+
+  describe('orgMode flag', () => {
+    it('includes work-only scopes when orgMode is true', () => {
+      const personal = buildScopesFromEndpoints(false, undefined, false);
+      const org = buildScopesFromEndpoints(true, undefined, false);
+      expect(org.length).toBeGreaterThan(personal.length);
+      expect(org).toContain('Sites.Read.All');
+      expect(personal).not.toContain('Sites.Read.All');
+    });
+  });
+
+  describe('org-mode + read-only + "search|query" filter', () => {
+    const scopes = buildScopesFromEndpoints(true, 'search|query', true);
+
+    it('includes Mail.Read via the read-only search-query POST, but never Mail.ReadWrite', () => {
+      // search-query is a POST flagged readOnly, so its read scopes (including
+      // Mail.Read) are pulled in even in read-only mode; the ReadWrite form is
+      // still collapsed away because no write endpoint survives the filter.
+      expect(scopes).toContain('Mail.Read');
+      expect(scopes).not.toContain('Mail.ReadWrite');
+    });
+
+    it('includes Files.Read and Sites.Read.All for read-only search tools', () => {
+      expect(scopes).toContain('Files.Read');
+      expect(scopes).toContain('Sites.Read.All');
+    });
+  });
+});
+
+describe('allowed scope helpers', () => {
+  describe('parseAllowedScopes', () => {
+    it('returns undefined when no value is provided', () => {
+      expect(parseAllowedScopes()).toBeUndefined();
+    });
+
+    it('splits on whitespace, trims, and deduplicates scopes', () => {
+      expect(parseAllowedScopes('  Mail.Read   Files.Read\nMail.Read\tUser.Read  ')).toEqual([
+        'Mail.Read',
+        'Files.Read',
+        'User.Read',
+      ]);
+    });
+
+    it('returns an empty array for supplied empty input', () => {
+      expect(parseAllowedScopes('   ')).toEqual([]);
+    });
+  });
+
+  describe('resolveAuthScopes', () => {
+    it('uses tool-derived scopes when allowed scopes are not supplied', () => {
+      const resolved = resolveAuthScopes({
+        orgMode: true,
+        enabledTools: 'search|query',
+        readOnly: true,
+      });
+      const derived = buildScopesFromEndpoints(true, 'search|query', true);
+      // resolveAuthScopes sorts its output; buildScopesFromEndpoints preserves
+      // endpoint insertion order. Compare as sets — the scope content is what matters.
+      expect([...resolved].sort()).toEqual([...derived].sort());
+    });
+
+    it('filters tool-derived scopes when allowed scopes are supplied', () => {
+      expect(
+        resolveAuthScopes({
+          orgMode: true,
+          enabledTools: 'mail|drive',
+          allowedScopes: 'Mail.Read Files.Read',
+        })
+      ).toEqual(expect.arrayContaining(['Files.Read', 'Mail.Read']));
+    });
+
+    it('treats broader allowed scopes as covering narrower tool scopes', () => {
+      const scopes = resolveAuthScopes({
+        enabledTools: 'list-mail-messages',
+        allowedScopes: 'Mail.ReadWrite',
+        readOnly: true,
+      });
+
+      expect(scopes).toEqual(['Mail.Read']);
+    });
+
+    it('appends extra scopes to the tool-derived scopes', () => {
+      const base = resolveAuthScopes({ enabledTools: 'list-mail-messages', readOnly: true });
+      const withExtra = resolveAuthScopes({
+        enabledTools: 'list-mail-messages',
+        readOnly: true,
+        extraScopes: 'CopilotPackages.ReadWrite.All',
+      });
+
+      expect(withExtra).toEqual([...base, 'CopilotPackages.ReadWrite.All']);
+    });
+
+    it('appends extra scopes even when an allowed-scopes filter is applied', () => {
+      const scopes = resolveAuthScopes({
+        enabledTools: 'list-mail-messages',
+        allowedScopes: 'Mail.Read',
+        readOnly: true,
+        extraScopes: 'CopilotPackages.ReadWrite.All',
+      });
+
+      expect(scopes).toContain('Mail.Read');
+      expect(scopes).toContain('CopilotPackages.ReadWrite.All');
+    });
+
+    it('deduplicates an extra scope already derived from a tool', () => {
+      const scopes = resolveAuthScopes({
+        enabledTools: 'list-mail-messages',
+        readOnly: true,
+        extraScopes: 'Mail.Read Mail.Read',
+      });
+
+      expect(scopes.filter((s) => s === 'Mail.Read')).toHaveLength(1);
+    });
+  });
+
+  describe('collapseScopeHierarchy', () => {
+    it('expands existing ReadWrite hierarchy for diagnostics', () => {
+      expect(collapseScopeHierarchy(['Mail.ReadWrite'])).toEqual(
+        expect.arrayContaining(['Mail.ReadWrite', 'Mail.Read'])
+      );
+    });
+
+    it('treats broad .All Graph scopes as covering narrower read scopes', () => {
+      expect(collapseScopeHierarchy(['Files.ReadWrite.All', 'Sites.ReadWrite.All'])).toEqual(
+        expect.arrayContaining([
+          'Files.ReadWrite.All',
+          'Files.Read.All',
+          'Files.ReadWrite',
+          'Files.Read',
+          'Sites.ReadWrite.All',
+          'Sites.Read.All',
+        ])
+      );
+    });
+  });
+});

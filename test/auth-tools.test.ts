@@ -20,16 +20,28 @@ vi.mock('zod', () => {
 
 describe('Auth Tools', () => {
   let server: { tool: ReturnType<typeof vi.fn> };
-  let authManager: { logout: ReturnType<typeof vi.fn>; testLogin: ReturnType<typeof vi.fn> };
+  let authManager: {
+    logout: ReturnType<typeof vi.fn>;
+    testLogin: ReturnType<typeof vi.fn>;
+    acquireTokenByDeviceCode: ReturnType<typeof vi.fn>;
+    getUseInteractiveAuth: ReturnType<typeof vi.fn>;
+    acquireTokenInteractive: ReturnType<typeof vi.fn>;
+    hasExpectedAccount: ReturnType<typeof vi.fn>;
+  };
   let loginTool: ReturnType<typeof vi.fn>;
+  let verifyLoginTool: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
     loginTool = vi.fn();
+    verifyLoginTool = vi.fn();
 
     server = {
       tool: vi.fn((name, description, schema, handler) => {
         if (name === 'login') {
           loginTool = handler;
+        }
+        if (name === 'verify-login') {
+          verifyLoginTool = handler;
         }
       }),
     };
@@ -37,6 +49,9 @@ describe('Auth Tools', () => {
     authManager = {
       testLogin: vi.fn(),
       acquireTokenByDeviceCode: vi.fn(),
+      getUseInteractiveAuth: vi.fn().mockReturnValue(false),
+      acquireTokenInteractive: vi.fn().mockResolvedValue(undefined),
+      hasExpectedAccount: vi.fn().mockReturnValue(false),
     };
 
     registerAuthTools(server, authManager);
@@ -81,6 +96,30 @@ describe('Auth Tools', () => {
       );
     });
 
+    it('should use interactive browser auth when authBrowser mode is enabled', async () => {
+      authManager.getUseInteractiveAuth.mockReturnValue(true);
+      authManager.testLogin
+        .mockResolvedValueOnce({ success: false, message: 'Not logged in' })
+        .mockResolvedValueOnce({
+          success: true,
+          message: 'Login successful',
+          userData: { displayName: 'Browser User' },
+        });
+
+      const result = await loginTool({ force: false });
+
+      expect(authManager.acquireTokenInteractive).toHaveBeenCalled();
+      expect(authManager.acquireTokenByDeviceCode).not.toHaveBeenCalled();
+      expect(result.content[0].text).toBe(
+        JSON.stringify({
+          status: 'Login successful',
+          success: true,
+          message: 'Login successful',
+          userData: { displayName: 'Browser User' },
+        })
+      );
+    });
+
     it('should proceed with login when not already logged in', async () => {
       authManager.testLogin.mockResolvedValue({
         success: false,
@@ -104,6 +143,41 @@ describe('Auth Tools', () => {
           message: 'Login instructions',
         })
       );
+    });
+
+    it('should proceed with login when expected account is missing', async () => {
+      authManager.testLogin.mockResolvedValue({
+        success: false,
+        message: 'Expected Microsoft account not found in token cache.',
+      });
+
+      authManager.acquireTokenByDeviceCode.mockImplementation(
+        (callback: (text: string) => void) => {
+          callback('Login instructions');
+          return Promise.resolve();
+        }
+      );
+
+      const result = await loginTool({ force: false });
+
+      expect(authManager.testLogin).toHaveBeenCalled();
+      expect(authManager.acquireTokenByDeviceCode).toHaveBeenCalled();
+      expect(result.content[0].text).toContain('device_code_required');
+    });
+  });
+
+  describe('verify-login tool', () => {
+    it('should return JSON failure when verification throws', async () => {
+      authManager.testLogin.mockRejectedValue(new Error('Expected Microsoft account missing'));
+
+      const result = await verifyLoginTool({});
+      const parsed = JSON.parse(result.content[0].text);
+
+      expect(parsed).toEqual({
+        success: false,
+        message: 'Login failed: Expected Microsoft account missing',
+      });
+      expect(result.isError).toBeUndefined();
     });
   });
 });
